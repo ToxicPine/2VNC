@@ -1,8 +1,8 @@
 # 2VNC
 
-2VNC gives you universal preview environments -- powered by Nix and Tailscale.
+2VNC creates preview environments for your work-in-progress software, within GitHub Issues/PRs — powered by Nix and Tailscale.
 
-The usual preview environment only works well for web apps: open a pull request, get a temporary URL, click around in the browser. That breaks down when the thing you need to preview is a desktop app, a terminal UI, a local service, an admin tool, or something that only makes sense inside a full running machine.
+The usual preview environment only works well for web apps: open a pull request, ping the preview-related bot, get a temporary URL, click around in the browser. That breaks down when the thing you need to preview is a desktop app, a terminal UI, a local service, an admin tool, or something that only makes sense inside a full running machine.
 
 2VNC makes those all feel like the same kind of preview.
 
