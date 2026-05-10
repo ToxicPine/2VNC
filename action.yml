@@ -1,0 +1,357 @@
+name: 2VNC Preview
+description: Build a Nix universal preview environment and deploy it to a Fly private network.
+
+inputs:
+  command:
+    description: Preview command. Defaults to the first line of the PR comment.
+    required: false
+    default: ""
+  github-token:
+    description: Token used to read PR metadata and write preview comments.
+    required: true
+  fly-api-token:
+    description: Fly.io API token used by flyctl, skopeo, and Ambit.
+    required: true
+  fly-private-network:
+    description: Fly private network name. If Ambit created staging, this is staging.
+    required: false
+    default: staging
+  fly-org:
+    description: Fly.io organization slug.
+    required: false
+    default: personal
+  fly-region:
+    description: Primary Fly.io region for preview machines.
+    required: false
+    default: lhr
+  require-trusted-author:
+    description: Only allow OWNER, MEMBER, or COLLABORATOR PR comments.
+    required: false
+    default: "true"
+
+outputs:
+  mode:
+    description: Parsed command mode: start, stop, or invalid.
+    value: ${{ steps.cmd.outputs.mode }}
+  preview-app:
+    description: Short preview app name.
+    value: ${{ steps.preview.outputs.app }}
+  preview-address:
+    description: Tailnet address for the preview environment.
+    value: ${{ steps.preview.outputs.address }}
+
+runs:
+  using: composite
+  steps:
+    - name: Parse Command
+      id: cmd
+      shell: bash
+      env:
+        COMMAND_INPUT: ${{ inputs.command }}
+      run: |
+        set -euo pipefail
+
+        : "${GITHUB_OUTPUT:?}"
+
+        body="$COMMAND_INPUT"
+        if [[ -z "$body" ]]; then
+          : "${GITHUB_EVENT_PATH:?}"
+          body="$(jq -r '.comment.body // ""' "$GITHUB_EVENT_PATH" | sed -n '1p')"
+        fi
+
+        body="$(printf '%s' "$body" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+
+        if [[ "$body" =~ ^/preview[[:space:]]+stop[[:space:]]+([a-z0-9-]+)$ ]]; then
+          {
+            echo "mode=stop"
+            echo "app=${BASH_REMATCH[1]}"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [[ "$body" =~ ^/preview[[:space:]]+([^[:space:]]+)$ ]]; then
+          {
+            echo "mode=start"
+            echo "target=${BASH_REMATCH[1]}"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "mode=invalid" >> "$GITHUB_OUTPUT"
+
+    - name: Reject Untrusted User
+      if: steps.cmd.outputs.mode != 'invalid' && inputs.require-trusted-author == 'true' && github.event_name == 'issue_comment'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        : "${GITHUB_EVENT_PATH:?}"
+        : "${GITHUB_REPOSITORY:?}"
+        : "${GH_TOKEN:?}"
+
+        association="$(jq -r '.comment.author_association' "$GITHUB_EVENT_PATH")"
+        issue_number="$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
+
+        case "$association" in
+          OWNER|MEMBER|COLLABORATOR)
+            exit 0
+            ;;
+          *)
+            gh api \
+              --method POST \
+              "/repos/${GITHUB_REPOSITORY}/issues/${issue_number}/comments" \
+              -f body="Not allowed."
+            exit 1
+            ;;
+        esac
+
+    - name: Install Dependencies
+      if: steps.cmd.outputs.mode != 'invalid'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y git jq
+
+    - name: Install Nix
+      if: steps.cmd.outputs.mode != 'invalid'
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Enforce Pull Request Context
+      if: steps.cmd.outputs.mode != 'invalid' && github.event_name == 'issue_comment'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        : "${GITHUB_EVENT_PATH:?}"
+        : "${GITHUB_REPOSITORY:?}"
+        : "${GH_TOKEN:?}"
+
+        if ! jq -e '.issue.pull_request' "$GITHUB_EVENT_PATH" > /dev/null; then
+          issue_number="$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
+          gh api \
+            --method POST \
+            "/repos/${GITHUB_REPOSITORY}/issues/${issue_number}/comments" \
+            -f body="Preview commands are only allowed on pull request comments."
+          exit 1
+        fi
+
+    - name: Checkout Pull Request Head
+      if: steps.cmd.outputs.mode == 'start'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        : "${GITHUB_EVENT_PATH:?}"
+        : "${GITHUB_REPOSITORY:?}"
+        : "${GH_TOKEN:?}"
+
+        rm -rf repo
+        git clone \
+          "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+          repo
+
+        cd repo
+
+        if [[ "${GITHUB_EVENT_NAME:-}" == "issue_comment" ]]; then
+          pr_number="$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
+          git fetch origin "pull/${pr_number}/head:preview-pr-${pr_number}"
+          git checkout "preview-pr-${pr_number}"
+        else
+          git checkout "${GITHUB_SHA:?}"
+        fi
+
+    - name: Start Preview
+      if: steps.cmd.outputs.mode == 'start'
+      id: preview
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        FLY_API_TOKEN: ${{ inputs.fly-api-token }}
+        FLY_ORG: ${{ inputs.fly-org }}
+        FLY_REGION: ${{ inputs.fly-region }}
+        FLY_PRIVATE_NETWORK: ${{ inputs.fly-private-network }}
+        TARGET: ${{ steps.cmd.outputs.target }}
+      run: |
+        set -euo pipefail
+
+        : "${FLY_API_TOKEN:?}"
+        : "${FLY_ORG:?}"
+        : "${FLY_REGION:?}"
+        : "${FLY_PRIVATE_NETWORK:?}"
+        : "${GH_TOKEN:?}"
+        : "${GITHUB_OUTPUT:?}"
+        : "${TARGET:?}"
+
+        export NIX_CONFIG="experimental-features = nix-command flakes"
+
+        cd repo
+
+        allowed_target='^\./[-A-Za-z0-9._/]+#[A-Za-z0-9._-]+$'
+        if [[ "$TARGET" == *--* ]] || [[ "$TARGET" == *'..'* ]] || [[ ! "$TARGET" =~ $allowed_target ]]; then
+          if [[ "${GITHUB_EVENT_NAME:-}" == "issue_comment" ]]; then
+            issue_number="$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
+            gh api \
+              --method POST \
+              "/repos/${GITHUB_REPOSITORY}/issues/${issue_number}/comments" \
+              -f body="Invalid Nix installable. Use: \`/preview ./path/to/flake#bundleName\`."
+          fi
+          exit 1
+        fi
+
+        target_path="${TARGET%%#*}"
+        if [[ ! -e "$target_path" ]]; then
+          if [[ "${GITHUB_EVENT_NAME:-}" == "issue_comment" ]]; then
+            issue_number="$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
+            gh api \
+              --method POST \
+              "/repos/${GITHUB_REPOSITORY}/issues/${issue_number}/comments" \
+              -f body="Path not found in repository: \`$target_path\`."
+          fi
+          exit 1
+        fi
+
+        short_sha="$(git rev-parse --short=8 HEAD)"
+        random_suffix="$(openssl rand -hex 4)"
+        app="prv-${short_sha}-${random_suffix}"
+        address="${app}.${FLY_PRIVATE_NETWORK}"
+        remote_image="registry.fly.io/${app}:latest"
+        created_app=false
+        cleanup_enabled=false
+
+        cleanup_app() {
+          if [[ "$cleanup_enabled" == true ]]; then
+            nix shell nixpkgs#flyctl --command flyctl apps destroy "$app" --yes || true
+          fi
+        }
+        trap cleanup_app ERR
+
+        nix bundle --bundler github:NixOS/bundlers#toDockerImage "$TARGET" -o result
+
+        image_archive="$(readlink -f result)"
+
+        if tar -tf "$image_archive" | grep -qx 'manifest.json'; then
+          source_image="docker-archive:${image_archive}"
+        elif tar -tf "$image_archive" | grep -qx 'index.json'; then
+          source_image="oci-archive:${image_archive}"
+        else
+          if [[ "${GITHUB_EVENT_NAME:-}" == "issue_comment" ]]; then
+            issue_number="$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
+            gh api \
+              --method POST \
+              "/repos/${GITHUB_REPOSITORY}/issues/${issue_number}/comments" \
+              -f body="Nix bundle output is not a Docker or OCI image archive."
+          fi
+          exit 1
+        fi
+
+        nix shell nixpkgs#skopeo --command skopeo copy \
+          --dest-creds "x:${FLY_API_TOKEN}" \
+          "$source_image" \
+          "docker://${remote_image}"
+
+        nix shell nixpkgs#flyctl --command flyctl apps create "$app" \
+          --org "$FLY_ORG" \
+          --network "$FLY_PRIVATE_NETWORK"
+        created_app=true
+        cleanup_enabled=true
+
+        cat > fly.preview.toml <<EOF
+        app = "$app"
+        primary_region = "$FLY_REGION"
+        EOF
+
+        nix shell nixpkgs#flyctl --command flyctl deploy \
+          --app "$app" \
+          --config fly.preview.toml \
+          --image "$remote_image" \
+          --region "$FLY_REGION" \
+          --ha=false \
+          --no-public-ips \
+          --detach
+
+        trap - ERR
+
+        {
+          echo "app=$app"
+          echo "address=$address"
+        } >> "$GITHUB_OUTPUT"
+
+        if [[ "${GITHUB_EVENT_NAME:-}" == "issue_comment" ]]; then
+          issue_number="$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
+          gh api \
+            --method POST \
+            "/repos/${GITHUB_REPOSITORY}/issues/${issue_number}/comments" \
+            -f body="Preview environment deployed: \`${address}\`"
+        fi
+
+    - name: Stop Preview
+      if: steps.cmd.outputs.mode == 'stop'
+      shell: bash
+      env:
+        APP: ${{ steps.cmd.outputs.app }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        FLY_API_TOKEN: ${{ inputs.fly-api-token }}
+        FLY_ORG: ${{ inputs.fly-org }}
+        FLY_PRIVATE_NETWORK: ${{ inputs.fly-private-network }}
+      run: |
+        set -euo pipefail
+
+        : "${APP:?}"
+        : "${GH_TOKEN:?}"
+        : "${FLY_API_TOKEN:?}"
+        : "${FLY_ORG:?}"
+        : "${FLY_PRIVATE_NETWORK:?}"
+
+        if [[ ! "$APP" =~ ^prv-[a-z0-9]+-[a-f0-9]{8}$ ]]; then
+          if [[ "${GITHUB_EVENT_NAME:-}" == "issue_comment" ]]; then
+            issue_number="$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
+            gh api \
+              --method POST \
+              "/repos/${GITHUB_REPOSITORY}/issues/${issue_number}/comments" \
+              -f body="Invalid preview name."
+          fi
+          exit 1
+        fi
+
+        address="${APP}.${FLY_PRIVATE_NETWORK}"
+
+        nix shell nixpkgs#flyctl --command flyctl apps destroy "$APP" --yes
+
+        if [[ "${GITHUB_EVENT_NAME:-}" == "issue_comment" ]]; then
+          issue_number="$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
+          gh api \
+            --method POST \
+            "/repos/${GITHUB_REPOSITORY}/issues/${issue_number}/comments" \
+            -f body="Stopped preview environment \`${address}\`."
+        fi
+
+    - name: Invalid Command
+      if: steps.cmd.outputs.mode == 'invalid'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        if [[ "${GITHUB_EVENT_NAME:-}" == "issue_comment" ]]; then
+          : "${GH_TOKEN:?}"
+          : "${GITHUB_EVENT_PATH:?}"
+          : "${GITHUB_REPOSITORY:?}"
+
+          issue_number="$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
+
+          gh api \
+            --method POST \
+            "/repos/${GITHUB_REPOSITORY}/issues/${issue_number}/comments" \
+            -f body="Usage: \`/preview <nix-installable>\` or \`/preview stop <preview-name>\`."
+        else
+          echo "Usage: /preview <nix-installable> or /preview stop <preview-name>" >&2
+        fi
+        exit 1
